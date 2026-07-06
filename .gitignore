@@ -2,3 +2,5 @@
 __pycache__/
 *.pyc
 .server.pid
+prodDbConfig.json
+*dbconfig*.json
