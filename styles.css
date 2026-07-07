@@ -412,6 +412,10 @@ select:focus {
   display: block;
 }
 
+#trendChart .hover-col {
+  cursor: pointer;
+}
+
 .table-card {
   border: 1px solid var(--border);
   border-radius: var(--radius-md);

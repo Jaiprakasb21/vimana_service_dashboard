@@ -52,8 +52,16 @@ const stateCache = {
   tiles: { today: 0, yesterday: 0, monthToDate: 0, lastMonth: 0 },
   trend: [],
   failureReasons: [],
-  loading: false
+  loading: false,
+  hasFetched: false
 };
+
+let activeFetchController = null;
+
+function invalidateFetchedData() {
+  stateCache.hasFetched = false;
+  elements.downloadBtn.disabled = true;
+}
 
 function setup() {
   bindEvents();
@@ -66,7 +74,9 @@ async function initializeApp() {
   try {
     await loadClientOptions();
     updateConnectionUi(true);
-    await render(true);
+    updateScope();
+    validateDateRange();
+    renderIdleState();
   } catch (error) {
     console.error(error);
     updateConnectionUi(false);
@@ -94,15 +104,16 @@ function populateClientOptions() {
 }
 
 function bindEvents() {
-  elements.serviceSelect.addEventListener("change", async (event) => {
+  elements.serviceSelect.addEventListener("change", (event) => {
     state.service = event.target.value;
+    invalidateFetchedData();
     updateScope();
-    await runDashboardQuery(true);
   });
 
   elements.clientSelect.addEventListener("change", (event) => {
     state.clientCode = event.target.value;
     state.searchText = state.clientCode === "ALL" ? "" : state.clientCode;
+    invalidateFetchedData();
     syncInputs();
   });
 
@@ -115,16 +126,19 @@ function bindEvents() {
       state.clientCode = exactMatch || "ALL";
     }
     elements.clientSelect.value = state.clientCode;
+    invalidateFetchedData();
   });
 
   elements.fromDate.addEventListener("change", (event) => {
     state.fromDate = event.target.value;
+    invalidateFetchedData();
     updateScope();
     validateDateRange();
   });
 
   elements.toDate.addEventListener("change", (event) => {
     state.toDate = event.target.value;
+    invalidateFetchedData();
     updateScope();
     validateDateRange();
   });
@@ -138,11 +152,16 @@ function bindEvents() {
   });
 
   elements.resetBtn.addEventListener("click", () => {
+    if (activeFetchController) {
+      activeFetchController.abort();
+    }
     Object.assign(state, DEFAULT_STATE);
+    invalidateFetchedData();
+    stateCache.loading = false;
     syncInputs();
     updateScope();
     validateDateRange();
-    runDashboardQuery(true);
+    setLoading(false);
   });
 
   elements.downloadBtn.addEventListener("click", downloadCsv);
@@ -183,6 +202,15 @@ function validateDateRange() {
   return hasValidRange;
 }
 
+function renderIdleState() {
+  const emptySummary = { successCount: 0, failureCount: 0, totalCount: 0 };
+  renderStatusCards(emptySummary);
+  renderTiles({ today: 0, yesterday: 0, monthToDate: 0, lastMonth: 0 });
+  renderTrendChart([]);
+  elements.tableWrap.innerHTML = '<div class="table-card"><div class="row-empty">Click Run to load data for the selected filters.</div></div>';
+  renderFailureReasons([]);
+}
+
 function renderValidationState() {
   const emptySummary = { successCount: 0, failureCount: 0, totalCount: 0 };
   renderStatusCards(emptySummary);
@@ -216,6 +244,12 @@ async function runDashboardQuery(updateTimestamp = false) {
 }
 
 async function fetchDashboardData() {
+  if (activeFetchController) {
+    activeFetchController.abort();
+  }
+  const controller = new AbortController();
+  activeFetchController = controller;
+
   stateCache.loading = true;
   setLoading(true);
   const params = new URLSearchParams({
@@ -225,7 +259,7 @@ async function fetchDashboardData() {
     clientCode: state.clientCode
   });
   try {
-    const response = await fetch(`/api/dashboard?${params.toString()}`);
+    const response = await fetch(`/api/dashboard?${params.toString()}`, { signal: controller.signal });
     const payload = await response.json();
     if (!response.ok) {
       throw new Error(payload.error || "Failed to fetch dashboard data");
@@ -235,16 +269,24 @@ async function fetchDashboardData() {
     stateCache.tiles = payload.tiles || stateCache.tiles;
     stateCache.trend = payload.trend || [];
     stateCache.failureReasons = payload.failureReasons || [];
+    stateCache.hasFetched = true;
   } catch (error) {
+    if (error.name === "AbortError") {
+      return;
+    }
     console.error(error);
     stateCache.rows = [];
     stateCache.summary = { successCount: 0, failureCount: 0, totalCount: 0 };
     stateCache.tiles = { today: 0, yesterday: 0, monthToDate: 0, lastMonth: 0 };
     stateCache.trend = [];
     stateCache.failureReasons = [];
+    stateCache.hasFetched = false;
     updateConnectionUi(false);
     elements.tableWrap.innerHTML = `<div class="table-card"><div class="row-empty">${escapeHtml(error.message || "Backend unavailable. Start with python server.py.")}</div></div>`;
   } finally {
+    if (activeFetchController === controller) {
+      activeFetchController = null;
+    }
     stateCache.loading = false;
     setLoading(false);
   }
@@ -256,15 +298,15 @@ function updateConnectionUi(isAvailable) {
     : '<span class="live-dot"></span>Backend required';
   elements.runBtn.disabled = !isAvailable || stateCache.loading;
   elements.refreshBtn.disabled = !isAvailable || stateCache.loading;
-  elements.downloadBtn.disabled = !isAvailable || stateCache.loading;
+  elements.downloadBtn.disabled = !isAvailable || stateCache.loading || !stateCache.hasFetched;
 }
 
 function setLoading(isLoading) {
   stateCache.loading = isLoading;
   elements.runBtn.disabled = isLoading || !stateCache.clients.length;
   elements.refreshBtn.disabled = isLoading || !stateCache.clients.length;
-  elements.downloadBtn.disabled = isLoading || !stateCache.clients.length;
-  elements.resetBtn.disabled = isLoading;
+  elements.downloadBtn.disabled = isLoading || !stateCache.clients.length || !stateCache.hasFetched;
+  elements.resetBtn.disabled = false;
 }
 
 function updateScope() {
@@ -343,6 +385,18 @@ function renderTrendChart(data) {
     return `<text x="${x}" y="${height - 14}" text-anchor="middle" fill="#8b98ab" font-size="11">${escapeHtml(item.label)}</text>`;
   }).join("");
 
+  const colWidth = data.length === 1 ? innerWidth : xStep;
+  const hoverColumns = data.map((item, index) => {
+    const x = padding.left + (xStep * index);
+    const rectX = x - colWidth / 2;
+    const tooltip = `${item.label}\nSuccess: ${formatNumber(item.successCount)}\nFailure: ${formatNumber(item.failureCount)}\nTotal: ${formatNumber(item.totalCount)}`;
+    return `
+      <rect class="hover-col" x="${rectX}" y="${padding.top}" width="${colWidth}" height="${innerHeight}" fill="transparent">
+        <title>${escapeHtml(tooltip)}</title>
+      </rect>
+    `;
+  }).join("");
+
   elements.trendChart.innerHTML = `
     <rect x="0" y="0" width="${width}" height="${height}" rx="18" fill="#ffffff"></rect>
     ${yGrid}
@@ -351,6 +405,7 @@ function renderTrendChart(data) {
     ${polyline(points.total, "#2f5cb8")}
     ${pointMarkers(points.total, "#2f5cb8")}
     ${xLabels}
+    ${hoverColumns}
   `;
 }
 
@@ -432,7 +487,7 @@ function renderFailureReasons(rows) {
 }
 
 function downloadCsv() {
-  if (state.fromDate > state.toDate || !stateCache.clients.length || stateCache.loading) {
+  if (state.fromDate > state.toDate || !stateCache.clients.length || stateCache.loading || !stateCache.hasFetched) {
     return;
   }
   const params = new URLSearchParams({
